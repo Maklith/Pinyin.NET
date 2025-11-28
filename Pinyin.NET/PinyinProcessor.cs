@@ -165,6 +165,9 @@ public class PinyinProcessor
                         split.Add(sb.ToString());
                         sb.Clear();
                     }
+                    result.Add([cChar.ToString().ToLower()]);
+                    split.Add(cChar.ToString());
+                    
                     // continue; // 分隔符本身被丢弃
                 }
                 // 普通小写字母或数字
