@@ -40,39 +40,133 @@ public class PinyinSearcher<T>
     {
         if (string.IsNullOrWhiteSpace(query)) return Enumerable.Empty<SearchResults<T>>();
 
-        var queryLower = query.ToLower();
-        var keywords = queryLower.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-
+        var keywords = query.ToLowerInvariant()
+            .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
         var results = new ConcurrentBag<SearchResults<T>>();
 
         Parallel.ForEach(_cachedItems, item =>
         {
-            if (TryMatchStream(item, keywords, out var matchIndices, out var weight))
+            if (TryMatchStream(item, keywords, true, out var matchIndices, out var weight))
             {
                 results.Add(new SearchResults<T>
                 {
                     Source = item.Source,
                     Weight = weight,
-                    CharMatchResults = CreateMatchArray(item.OriginalString.Length, matchIndices)
+                    CharMatchResults = CreateMatchArray(item.OriginalString.Length, matchIndices!)
                 });
             }
         });
 
-        return results.OrderByDescending(r => r.Weight)
-                      .ThenBy(r => r.Source.ToString().Length);
+        return results.OrderByDescending(result => result.Weight)
+            .ThenBy(result => result.Source.ToString().Length);
     }
 
-    private bool TryMatchStream(CachedItem item, string[] keywords, out List<int> allMatchIndices, out double weight)
+    /// <summary>
+    /// Searches the cached entries without allocating highlight data for candidates that will not
+    /// be displayed. The cancellation token is checked between entries and before finalizing each
+    /// result so superseded interactive searches stop quickly.
+    /// </summary>
+    public IReadOnlyList<SearchResults<T>> Search(
+        string query,
+        int maximumResults,
+        CancellationToken cancellationToken)
     {
-        allMatchIndices = new List<int>();
+        if (string.IsNullOrWhiteSpace(query) || maximumResults <= 0)
+        {
+            return [];
+        }
+
+        var keywords = query.ToLowerInvariant()
+            .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        if (keywords.Length == 0)
+        {
+            return [];
+        }
+
+        var candidatePartitions = new List<PriorityQueue<SearchCandidate, SearchCandidate>>();
+        Parallel.ForEach(
+            _cachedItems,
+            new ParallelOptions { CancellationToken = cancellationToken },
+            () => new PriorityQueue<SearchCandidate, SearchCandidate>(SearchCandidateComparer.Instance),
+            (item, loopState, localCandidates) =>
+            {
+                _ = loopState;
+                if (TryMatchStream(item, keywords, false, out var ignoredMatchIndices, out var weight))
+                {
+                    AddCandidate(localCandidates, new SearchCandidate(item, weight), maximumResults);
+                }
+
+                return localCandidates;
+            },
+            localCandidates =>
+            {
+                lock (candidatePartitions)
+                {
+                    candidatePartitions.Add(localCandidates);
+                }
+            });
+
+        var candidates = new PriorityQueue<SearchCandidate, SearchCandidate>(SearchCandidateComparer.Instance);
+        foreach (var partition in candidatePartitions)
+        {
+            foreach (var candidate in partition.UnorderedItems)
+            {
+                AddCandidate(candidates, candidate.Element, maximumResults);
+            }
+        }
+
+        var selectedCandidates = candidates
+            .UnorderedItems
+            .Select(candidate => candidate.Element)
+            .OrderByDescending(candidate => candidate.Weight)
+            .ThenBy(candidate => candidate.Item.Source.ToString().Length)
+            .Take(maximumResults)
+            .ToList();
+        var results = new List<SearchResults<T>>(selectedCandidates.Count);
+        foreach (var candidate in selectedCandidates)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!TryMatchStream(candidate.Item, keywords, true, out var matchIndices, out _))
+            {
+                continue;
+            }
+
+            results.Add(new SearchResults<T>
+            {
+                Source = candidate.Item.Source,
+                Weight = candidate.Weight,
+                CharMatchResults = CreateMatchArray(candidate.Item.OriginalString.Length, matchIndices!)
+            });
+        }
+
+        return results;
+    }
+
+    private bool TryMatchStream(
+        CachedItem item,
+        string[] keywords,
+        bool captureMatchIndices,
+        out List<int>? allMatchIndices,
+        out double weight)
+    {
+        allMatchIndices = captureMatchIndices ? new List<int>() : null;
         weight = 0;
         int globalCharIndex = 0;
 
         foreach (var keyword in keywords)
         {
-            if (ScanForwardForKeyword(item, globalCharIndex, keyword, out var keywordIndices, out int matchEndIndex))
+            if (ScanForwardForKeyword(
+                    item,
+                    globalCharIndex,
+                    keyword,
+                    captureMatchIndices,
+                    out var keywordIndices,
+                    out int matchEndIndex))
             {
-                allMatchIndices.AddRange(keywordIndices);
+                if (captureMatchIndices)
+                {
+                    allMatchIndices!.AddRange(keywordIndices!);
+                }
                 weight += (1000 - matchEndIndex); 
                 globalCharIndex = matchEndIndex;
             }
@@ -84,7 +178,13 @@ public class PinyinSearcher<T>
         return true;
     }
 
-    private bool ScanForwardForKeyword(CachedItem item, int startIdx, string keyword, out List<int> indices, out int endIndex)
+    private bool ScanForwardForKeyword(
+        CachedItem item,
+        int startIdx,
+        string keyword,
+        bool captureMatchIndices,
+        out List<int>? indices,
+        out int endIndex)
     {
         indices = null;
         endIndex = -1;
@@ -92,7 +192,7 @@ public class PinyinSearcher<T>
 
         for (int i = startIdx; i < sourceLen; i++)
         {
-            if (IsMatchSequence(item, i, keyword, out var matchIndices, out int scanEnd))
+            if (IsMatchSequence(item, i, keyword, captureMatchIndices, out var matchIndices, out int scanEnd))
             {
                 indices = matchIndices;
                 endIndex = scanEnd;
@@ -102,15 +202,21 @@ public class PinyinSearcher<T>
         return false;
     }
 
-    private bool IsMatchSequence(CachedItem item, int startPos, string keyword, out List<int> matchIndices, out int scanEndPos)
+    private bool IsMatchSequence(
+        CachedItem item,
+        int startPos,
+        string keyword,
+        bool captureMatchIndices,
+        out List<int>? matchIndices,
+        out int scanEndPos)
     {
-        matchIndices = new List<int>();
+        matchIndices = captureMatchIndices ? new List<int>() : null;
         scanEndPos = startPos;
         
         int kIdx = 0; // Query 游标
         int sIdx = startPos; // Source 游标
 
-        List<int> gapIndices = new List<int>(); 
+        List<int>? gapIndices = captureMatchIndices ? new List<int>() : null;
 
         while (kIdx < keyword.Length && sIdx < item.OriginalString.Length)
         {
@@ -128,7 +234,7 @@ public class PinyinSearcher<T>
                 }
                 else
                 {
-                    gapIndices.Add(sIdx);
+                    gapIndices?.Add(sIdx);
                     sIdx++;
                     continue;
                 }
@@ -157,10 +263,10 @@ public class PinyinSearcher<T>
                 // 如果找到了匹配 (例如匹配了 "t", "te", "teng")
                 if (bestMatchLen > 0)
                 {
-                    matchIndices.AddRange(gapIndices);
-                    gapIndices.Clear();
+                    matchIndices?.AddRange(gapIndices!);
+                    gapIndices?.Clear();
                     
-                    matchIndices.Add(sIdx);
+                    matchIndices?.Add(sIdx);
                     
                     kIdx += bestMatchLen; // Query 前进 N 步
                     sIdx++;               // Source 前进 1 步 (因为一个汉字就是一个字符)
@@ -176,9 +282,9 @@ public class PinyinSearcher<T>
                 char kChar = keyword[kIdx];
                 if (IsCharMatch(token, charOffsetInToken, kChar))
                 {
-                    matchIndices.AddRange(gapIndices);
-                    gapIndices.Clear();
-                    matchIndices.Add(sIdx);
+                    matchIndices?.AddRange(gapIndices!);
+                    gapIndices?.Clear();
+                    matchIndices?.Add(sIdx);
                     kIdx++;
                     sIdx++;
                     continue;
@@ -206,7 +312,7 @@ public class PinyinSearcher<T>
                 if (sIdx < currentTokenEndIndex)
                 {
                     sIdx = currentTokenEndIndex;
-                    gapIndices.Clear();
+                    gapIndices?.Clear();
                     continue;
                 }
             }
@@ -307,5 +413,37 @@ public class PinyinSearcher<T>
         public T Source { get; set; }
         public string OriginalString { get; set; }
         public PinyinToken[] PinyinTokens { get; set; }
+    }
+
+    private readonly record struct SearchCandidate(CachedItem Item, double Weight);
+
+    private static void AddCandidate(
+        PriorityQueue<SearchCandidate, SearchCandidate> candidates,
+        SearchCandidate candidate,
+        int maximumResults)
+    {
+        if (candidates.Count < maximumResults)
+        {
+            candidates.Enqueue(candidate, candidate);
+        }
+        else if (candidates.TryPeek(out var worstCandidate, out _)
+                 && SearchCandidateComparer.Instance.Compare(candidate, worstCandidate) > 0)
+        {
+            candidates.Dequeue();
+            candidates.Enqueue(candidate, candidate);
+        }
+    }
+
+    private sealed class SearchCandidateComparer : IComparer<SearchCandidate>
+    {
+        public static readonly SearchCandidateComparer Instance = new();
+
+        public int Compare(SearchCandidate x, SearchCandidate y)
+        {
+            var weightComparison = x.Weight.CompareTo(y.Weight);
+            return weightComparison != 0
+                ? weightComparison
+                : y.Item.Source.ToString().Length.CompareTo(x.Item.Source.ToString().Length);
+        }
     }
 }
