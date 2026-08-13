@@ -5,7 +5,10 @@ namespace Pinyin.NET;
 public class PinyinSearcher<T>
 {
     private readonly List<CachedItem> _cachedItems;
-    private readonly PinyinProcessor _pinyinProcessor = new PinyinProcessor();
+    private readonly HashSet<T> _sources = new();
+    // The dictionaries are immutable after construction, so every search snapshot can safely
+    // share one processor instead of reloading the embedded pinyin tables on each rebuild.
+    private static readonly PinyinProcessor PinyinProcessor = new();
 
     private static readonly HashSet<char> _splitCharSet = new HashSet<char>
     {
@@ -23,7 +26,7 @@ public class PinyinSearcher<T>
     {
         foreach (var item in source)
         {
-            if (_cachedItems.Any(e => e.Source.Equals(item))) continue;
+            if (!_sources.Add(item)) continue;
             var text = selector(item);
             if (string.IsNullOrEmpty(text)) continue;
 
@@ -31,7 +34,7 @@ public class PinyinSearcher<T>
             {
                 Source = item,
                 OriginalString = text,
-                PinyinTokens = _pinyinProcessor.GetTokens(text)
+                PinyinTokens = PinyinProcessor.GetTokens(text)
             });
         }
     }
